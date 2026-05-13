@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import time
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from typing import Any
 
 # ---------------------------------------------------------------------------
@@ -53,9 +55,14 @@ class ResponseCache:
         self.ttl_seconds = ttl_seconds
         self.similarity_threshold = similarity_threshold
         self._entries: list[CacheEntry] = []
+        self.false_hit_log: list[dict[str, object]] = []
 
     def get(self, query: str) -> tuple[str | None, float]:
+        if _is_uncacheable(query):
+            return None, 0.0
+
         best_value: str | None = None
+        best_key: str | None = None
         best_score = 0.0
         now = time.time()
         self._entries = [e for e in self._entries if now - e.created_at <= self.ttl_seconds]
@@ -64,24 +71,41 @@ class ResponseCache:
             if score > best_score:
                 best_score = score
                 best_value = entry.value
+                best_key = entry.key
+
         if best_score >= self.similarity_threshold:
+            if best_key is not None and _looks_like_false_hit(query, best_key):
+                self.false_hit_log.append(
+                    {
+                        "query": query,
+                        "cached_query": best_key,
+                        "score": best_score,
+                        "reason": "year_or_id_mismatch",
+                    }
+                )
+                return None, best_score
             return best_value, best_score
         return None, best_score
 
     def set(self, query: str, value: str, metadata: dict[str, str] | None = None) -> None:
+        if _is_uncacheable(query):
+            return
         self._entries.append(CacheEntry(query, value, time.time(), metadata or {}))
 
     @staticmethod
     def similarity(a: str, b: str) -> float:
-        """Very small baseline similarity using token overlap.
+        """Deterministic semantic-ish similarity using token and char overlap."""
+        left_tokens = set(re.findall(r"[a-z0-9]+", a.lower()))
+        right_tokens = set(re.findall(r"[a-z0-9]+", b.lower()))
 
-        TODO(student): Improve with embeddings or a deterministic vectorizer.
-        """
-        left = set(a.lower().split())
-        right = set(b.lower().split())
+        left = left_tokens - {"the", "a", "an", "for", "of", "to", "in", "on"}
+        right = right_tokens - {"the", "a", "an", "for", "of", "to", "in", "on"}
         if not left or not right:
             return 0.0
-        return len(left & right) / len(left | right)
+
+        token_overlap = len(left & right) / len(left | right)
+        char_ratio = SequenceMatcher(None, a.lower().strip(), b.lower().strip()).ratio()
+        return 0.7 * token_overlap + 0.3 * char_ratio
 
 
 # ---------------------------------------------------------------------------
@@ -146,7 +170,43 @@ class SharedRedisCache:
         7. Before returning a match, check _looks_like_false_hit(); if true,
            append to self.false_hit_log and return (None, best_score)
         """
-        return None, 0.0
+        if _is_uncacheable(query):
+            return None, 0.0
+
+        exact_key = f"{self.prefix}{self._query_hash(query)}"
+        exact_response = self._redis.hget(exact_key, "response")
+        if exact_response is not None:
+            return str(exact_response), 1.0
+
+        best_score = 0.0
+        best_query: str | None = None
+        best_response: str | None = None
+        for key in self._redis.scan_iter(f"{self.prefix}*"):
+            cached_query = self._redis.hget(key, "query")
+            cached_response = self._redis.hget(key, "response")
+            if not cached_query or cached_response is None:
+                continue
+            score = ResponseCache.similarity(query, str(cached_query))
+            if score > best_score:
+                best_score = score
+                best_query = str(cached_query)
+                best_response = str(cached_response)
+
+        if best_response is None or best_score < self.similarity_threshold:
+            return None, best_score
+
+        if best_query is not None and _looks_like_false_hit(query, best_query):
+            self.false_hit_log.append(
+                {
+                    "query": query,
+                    "cached_query": best_query,
+                    "score": best_score,
+                    "reason": "year_or_id_mismatch",
+                }
+            )
+            return None, best_score
+
+        return best_response, best_score
 
     def set(self, query: str, value: str, metadata: dict[str, str] | None = None) -> None:
         """Store a response in Redis with TTL.
@@ -157,7 +217,19 @@ class SharedRedisCache:
         3. self._redis.hset(key, mapping={"query": query, "response": value})
         4. self._redis.expire(key, self.ttl_seconds)
         """
-        pass
+        if _is_uncacheable(query):
+            return
+
+        key = f"{self.prefix}{self._query_hash(query)}"
+        self._redis.hset(
+            key,
+            mapping={
+                "query": query,
+                "response": value,
+                "metadata": json.dumps(metadata or {}, ensure_ascii=True),
+            },
+        )
+        self._redis.expire(key, self.ttl_seconds)
 
     def flush(self) -> None:
         """Remove all entries with this cache prefix (for testing)."""

@@ -60,7 +60,7 @@ def calculate_recovery_time_ms(gateway: ReliabilityGateway) -> float | None:
         open_ts: float | None = None
         for entry in breaker.transition_log:
             if entry["to"] == "open" and open_ts is None:
-                open_ts = entry["ts"]
+                open_ts = float(entry["ts"])
             elif entry["to"] == "closed" and open_ts is not None:
                 recovery_times.append((float(entry["ts"]) - open_ts) * 1000)
                 open_ts = None
@@ -71,9 +71,13 @@ def calculate_recovery_time_ms(gateway: ReliabilityGateway) -> float | None:
 
 def run_scenario(config: LabConfig, queries: list[str], scenario: ScenarioConfig) -> RunMetrics:
     """Run a single named chaos scenario."""
-    gateway = build_gateway(config, scenario.provider_overrides or None)
+    scenario_config = copy.deepcopy(config)
+    if scenario.name in {"primary_timeout_100", "primary_flaky_50"}:
+        scenario_config.cache.enabled = False
+
+    gateway = build_gateway(scenario_config, scenario.provider_overrides or None)
     metrics = RunMetrics()
-    request_count = config.load_test.requests
+    request_count = scenario_config.load_test.requests
     for _ in range(request_count):
         prompt = random.choice(queries)
         result = gateway.complete(prompt)
@@ -82,10 +86,10 @@ def run_scenario(config: LabConfig, queries: list[str], scenario: ScenarioConfig
         if result.cache_hit:
             metrics.cache_hits += 1
             metrics.estimated_cost_saved += 0.001
-        if result.route == "fallback":
+        if result.route.startswith("fallback"):
             metrics.fallback_successes += 1
             metrics.successful_requests += 1
-        elif result.route == "static_fallback":
+        elif result.route.startswith("static_fallback"):
             metrics.static_fallbacks += 1
             metrics.failed_requests += 1
         else:
@@ -101,11 +105,7 @@ def run_scenario(config: LabConfig, queries: list[str], scenario: ScenarioConfig
 
 
 def run_simulation(config: LabConfig, queries: list[str]) -> RunMetrics:
-    """Run all named scenarios from config, or a default run if none defined.
-
-    TODO(student): Add a cache vs no-cache comparison scenario.
-    Extend with your own custom scenarios (e.g., cost cap near limit).
-    """
+    """Run all named scenarios from config and aggregate reliability metrics."""
     if not config.scenarios:
         default_scenario = ScenarioConfig(name="default", description="baseline run")
         metrics = run_scenario(config, queries, default_scenario)
@@ -113,12 +113,27 @@ def run_simulation(config: LabConfig, queries: list[str]) -> RunMetrics:
         return metrics
 
     combined = RunMetrics()
+
+    def scenario_passed(name: str, result: RunMetrics) -> bool:
+        availability = result.availability
+        if name == "primary_timeout_100":
+            return (
+                result.circuit_open_count >= 1
+                and result.fallback_success_rate >= 0.85
+                and availability >= 0.9
+            )
+        if name == "primary_flaky_50":
+            return result.circuit_open_count >= 1 and availability >= 0.9 and result.fallback_successes > 0
+        if name == "all_healthy":
+            return availability >= 0.95 and result.circuit_open_count == 0
+        if name == "cache_stale_candidate":
+            return result.cache_hit_rate <= 0.8
+        return availability > 0.0
+
     for scenario in config.scenarios:
         result = run_scenario(config, queries, scenario)
 
-        # TODO(student): Define pass/fail criteria per scenario.
-        # Example: primary_timeout_100 passes if fallback_success_rate > 0.9
-        passed = result.successful_requests > 0
+        passed = scenario_passed(scenario.name, result)
         combined.scenarios[scenario.name] = "pass" if passed else "fail"
 
         combined.total_requests += result.total_requests
@@ -136,5 +151,17 @@ def run_simulation(config: LabConfig, queries: list[str]) -> RunMetrics:
                 combined.recovery_time_ms = result.recovery_time_ms
             else:
                 combined.recovery_time_ms = (combined.recovery_time_ms + result.recovery_time_ms) / 2
+
+    if config.cache.enabled:
+        no_cache_config = copy.deepcopy(config)
+        no_cache_config.cache.enabled = False
+        baseline = ScenarioConfig(name="cache_baseline", description="without cache")
+        without_cache = run_scenario(no_cache_config, queries, baseline)
+        with_cache = run_scenario(config, queries, baseline)
+        comparison_passed = (
+            with_cache.estimated_cost <= without_cache.estimated_cost
+            and with_cache.cache_hit_rate >= without_cache.cache_hit_rate
+        )
+        combined.scenarios["cache_vs_no_cache"] = "pass" if comparison_passed else "fail"
 
     return combined
